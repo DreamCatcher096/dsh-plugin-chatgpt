@@ -123,12 +123,12 @@ export async function startCallbackListener(
     }
     if (query.error !== undefined) {
       response.writeHead(400, { 'content-type': 'text/html; charset=utf-8' })
-      response.end(page('ChatGPT was not connected', `The server reported: ${query.error}`))
+      response.end(page('ChatGPT was not connected', 'Authorization was declined. Return to DeepSeek Harness for the result.'))
       settle(query)
       return
     }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-    response.end(page('ChatGPT sign-in complete', 'You can close this window and return to DeepSeek Harness.'))
+    response.end(page('ChatGPT authorization received', 'Return to DeepSeek Harness; sign-in completes only after token verification.'))
     settle(query)
   })
 

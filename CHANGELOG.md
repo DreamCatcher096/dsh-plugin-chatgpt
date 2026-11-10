@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.18-allen.1
+
+- Fix the decode-only ID-token validation gap: await jose RS256 verification
+  against the pinned OpenAI issuer/JWKS, using the plugin's existing proxy fetch.
+- Require identity/time/nonce claims; bind returning client IDs and known real
+  subjects, retaining explicit subjects independently of credentials.
+- Share bounded JWKS caching, rotation cooldown and five-second fetch deadlines;
+  fail closed and avoid exposing callback, token, or raw server error values.
+- Replace unsigned success fixtures with RSA-signed tokens and cover signature,
+  claims, transport, cache, and account-preservation regressions.
+- See `docs/id-token-verification.md` for the trust model and migration limits.
+  This is a scoped fork fix, not an official certification.
+
 ## 0.1.18
 
 A plugin-scoped HTTP proxy can carry the ChatGPT adapter's server-side traffic.

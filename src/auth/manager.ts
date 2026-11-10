@@ -234,6 +234,7 @@ export class ChatGptAuth {
     const retained = stored === undefined ? this.retainedRegistration() : undefined
     const existing = stored ?? (retained === undefined ? undefined : {
       clientId: retained.clientId,
+      subject: retained.subject,
       email: retained.email,
     })
     const attemptOptions: SignInOptions = {
@@ -248,6 +249,7 @@ export class ChatGptAuth {
       ...existing === undefined ? {} : {
         registration: {
           clientId: existing.clientId,
+          ...existing.subject === undefined ? {} : { subject: existing.subject },
           ...existing.email === undefined ? {} : { loginHint: existing.email },
         },
       },
@@ -279,6 +281,7 @@ export class ChatGptAuth {
         ...document.registrations ?? {},
         [key]: {
           clientId: credential.clientId,
+          ...identity === undefined ? {} : { subject: identity },
           at: Date.now(),
           ...credential.email === undefined ? {} : { email: credential.email },
         },
@@ -335,7 +338,18 @@ export class ChatGptAuth {
 
   /** Forget one account, or every account when no subject is named. */
   signOut(subject?: string): void {
-    const document = this.load()
+    const current = this.load()
+    const registrations = { ...current.registrations ?? {} }
+    // Upgrade legacy registrations before removing the last copy of a known
+    // subject. Never infer it from the account-map key or from an email.
+    for (const [key, credential] of Object.entries(current.accounts)) {
+      const registration = registrations[key]
+      if (registration !== undefined && registration.clientId === credential.clientId
+        && typeof credential.subject === 'string' && credential.subject.trim().length > 0) {
+        registrations[key] = { ...registration, subject: credential.subject }
+      }
+    }
+    const document = { ...current, registrations }
     if (subject === undefined) {
       // Every credential goes; the registrations stay, because they describe the
       // account rather than the session and the next sign-in is expected to reuse

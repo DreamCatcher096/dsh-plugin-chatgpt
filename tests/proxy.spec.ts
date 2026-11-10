@@ -14,7 +14,7 @@ import { refreshCredential } from '../src/auth/refresh.ts'
 import { beginSignIn } from '../src/auth/sign-in.ts'
 import { revokeGrant } from '../src/auth/revoke.ts'
 import type { ChatGptCredential } from '../src/auth/credential.ts'
-import { idTokenClaims, jwt, waitFor } from './helpers.ts'
+import { fixtureJwks, idTokenClaims, jwt, OPENAI_JWKS_URL, requestUrl, waitFor } from './helpers.ts'
 
 const execFileAsync = promisify(execFile)
 const certificate = fileURLToPath(new URL('./fixtures/tls/localhost.crt', import.meta.url))
@@ -184,32 +184,56 @@ describe('scoped proxy transport', () => {
     assert.ok(tunnels.length >= 1)
   })
 
-  it('sends sign-in code exchange through the proxy', async () => {
+  it('sends sign-in code exchange and JWKS resolution through the proxy', async () => {
     let nonce = ''
     const clientId = 'oaiapp_proxy_test'
-    const requests: string[] = []
+    const paths: string[] = []
     const endpoint = await listen(createServer((request, response) => {
-      requests.push(request.url ?? '')
+      paths.push(request.url ?? '')
       response.setHeader('content-type', 'application/json')
-      response.end(JSON.stringify({
-        access_token: 'proxy-access', refresh_token: 'proxy-refresh', expires_in: 3600,
-        scope: 'openid chatgpt.tokens.use.direct',
-        id_token: jwt(idTokenClaims({ clientId, nonce })),
-      }))
+      response.end(JSON.stringify(request.url === '/jwks'
+        ? fixtureJwks
+        : {
+            access_token: 'proxy-access', refresh_token: 'proxy-refresh', expires_in: 3600,
+            scope: 'openid chatgpt.tokens.use.direct',
+            id_token: jwt(idTokenClaims({ clientId, nonce })),
+          }))
     }))
     const { url: proxyUrl, tunnels } = await startProxy()
     const transport = transportFor(proxyUrl)
+    const origin = new URL(endpoint)
+    const endpointHost = `${origin.hostname}:${origin.port}`
+
+    // The verifier only knows the published JWKS URL, while the token exchange
+    // uses this same transport. This wrapper is the bridge that makes the key
+    // fetch take the real CONNECT tunnel: it proves what was asked for, rewrites
+    // that one URL to the local endpoint, and hands every other request to the
+    // scoped transport unchanged. Serving the fixture directly here would let
+    // the test pass without the proxy ever carrying the key set.
+    const jwksViaProxy: typeof fetch = (input, init) => {
+      const url = requestUrl(input)
+      // Exactly the published key-set URL is bridged; nothing else may leave
+      // for auth.openai.com from a test run.
+      if (url === OPENAI_JWKS_URL) return transport.fetch(`${endpoint}/jwks`, init)
+      assert.ok(url.startsWith(`${endpoint}/`), `unexpected outbound request: ${url}`)
+      return transport.fetch(input, init)
+    }
+
     const attempt = await beginSignIn({
       agentHostId: 'urn:uuid:6f1c1a1e-2b3d-4c5e-8f90-1234567890ab',
       agentNameHint: 'Test', preferredPort: 0,
-      tokenUrl: `${endpoint}/token`, fetch: transport.fetch,
+      tokenUrl: `${endpoint}/token`, fetch: jwksViaProxy,
     })
     const params = new URL(attempt.authorizationUrl).searchParams
     nonce = params.get('nonce') ?? ''
     await attempt.submit(`${attempt.redirectUri}?code=test&state=${params.get('state')}&client_id=${clientId}`)
     assert.equal((await attempt.result).accessToken, 'proxy-access')
-    assert.deepEqual(requests, ['/token'])
-    assert.equal(tunnels.length, 1)
+
+    assert.deepEqual([...paths].sort(), ['/jwks', '/token'])
+    // Both requests reached the endpoint through the proxy. One pooled tunnel
+    // may carry them both, so the count is a lower bound rather than 2.
+    assert.ok(tunnels.length >= 1)
+    assert.ok(tunnels.every(tunnel => tunnel === endpointHost))
   })
 
   it('routes both discovery and revocation through the proxy', async () => {

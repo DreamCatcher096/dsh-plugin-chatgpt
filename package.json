@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-chatgpt",
-  "version": "0.1.18",
+  "version": "0.1.18-allen.1",
   "description": "Sign in with ChatGPT inside DeepSeek Harness, and use your ChatGPT subscription to serve models.",
   "keywords": [
     "dsh-plugin",
@@ -46,7 +46,8 @@
     "screenshots.json",
     "assets",
     "docs/README.zh.md",
-    "docs/cache-replay.md"
+    "docs/cache-replay.md",
+    "docs/id-token-verification.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -101,6 +102,7 @@
     "typescript": "^5.9.0"
   },
   "dependencies": {
+    "jose": "6.2.17",
     "undici": "^6.29.1"
   }
 }
