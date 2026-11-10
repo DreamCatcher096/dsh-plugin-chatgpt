@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { beginSignIn } from '../src/auth/sign-in.ts'
-import { idTokenClaims, jwt, startTokenServer, type TokenServer } from './helpers.ts'
+import { idTokenClaims, jwt, startTokenServer, withJwks, type TokenServer } from './helpers.ts'
 
 const AGENT_HOST_ID = 'urn:uuid:6f1c1a1e-2b3d-4c5e-8f90-1234567890ab'
 const closers: (() => Promise<void>)[] = []
@@ -40,10 +40,14 @@ describe('beginSignIn', () => {
       closers.push(token.close)
       const attempt = await beginSignIn({
         agentHostId: AGENT_HOST_ID, agentNameHint: 'Test', tokenUrl: token.url, preferredPort: 0,
+        fetch: withJwks(),
       })
       const params = paramsOf(attempt.authorizationUrl)
       nonce.value = params.get('nonce') ?? ''
-      const rejected = assert.rejects(attempt.result, missing === 'id_token' ? /id_token/ : /sub/)
+      // A missing id_token is still reported by field name; every other
+      // rejected identity is generalized so an attacker learns nothing about
+      // which claim failed.
+      const rejected = assert.rejects(attempt.result, missing === 'id_token' ? /id_token/ : /ID token/)
       await attempt.submit(`${attempt.redirectUri}?code=test&state=${params.get('state')}&client_id=oaiapp_identity`)
       await rejected
       assert.equal(token.requests.length, 1)
@@ -114,7 +118,7 @@ describe('beginSignIn', () => {
       preferredPort: 0,
     })
     const state = paramsOf(attempt.authorizationUrl).get('state') ?? ''
-    const refusedResult = assert.rejects(attempt.result, /access_denied/)
+    const refusedResult = assert.rejects(attempt.result, /declined the authorization/)
     const declined = await fetch(`${attempt.redirectUri}?error=access_denied&state=${state}`)
     assert.equal(declined.status, 400)
     await refusedResult
@@ -141,6 +145,7 @@ describe('beginSignIn', () => {
       agentNameHint: 'DeepSeek Harness',
       tokenUrl: token.url,
       preferredPort: 0,
+      fetch: withJwks(),
     })
     const params = paramsOf(attempt.authorizationUrl)
     const state = params.get('state') ?? ''
@@ -191,6 +196,7 @@ describe('beginSignIn', () => {
       agentNameHint: 'DeepSeek Harness',
       tokenUrl: token.url,
       preferredPort: 0,
+      fetch: withJwks(),
     })
     const params = paramsOf(attempt.authorizationUrl)
     nonce.value = params.get('nonce') ?? ''
@@ -236,6 +242,7 @@ describe('beginSignIn', () => {
       agentNameHint: 'DeepSeek Harness',
       tokenUrl: token.url,
       preferredPort: 0,
+      fetch: withJwks(),
     })
     const params = paramsOf(attempt.authorizationUrl)
     nonce.value = params.get('nonce') ?? ''

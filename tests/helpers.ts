@@ -1,13 +1,18 @@
 /**
- * Test doubles: a token endpoint, an unsigned ID token, and a body reader.
+ * Test doubles: a token endpoint, an RS256-signed ID token, the JWK Set that
+ * verifies it, and a transport that answers the one JWKS URL sign-in fetches.
  *
- * The ID token is deliberately unsigned. Signature verification is a separate
- * documented step this plugin does not perform, so the checks under test are
- * claim checks — and signing a token would only test the fixture.
+ * The ID token is genuinely signed. Sign-in verifies every ID token against
+ * OpenAI's published JWKS, fetched over the injected transport, so a fixture
+ * that were merely base64url-encoded would drive each success test down the
+ * rejection path. The key pair is generated once per test process with
+ * `node:crypto`, and its public half is exported as {@link fixtureJwks} for a
+ * transport to serve in place of the real `jwks_uri`.
  */
 
 import { createServer, type Server } from 'node:http'
 import assert from 'node:assert/strict'
+import { generateKeyPairSync, sign as signData } from 'node:crypto'
 
 /** Narrow an expected fixture element with a real runtime assertion. */
 export function required<T>(value: T | undefined): T {
@@ -29,11 +34,67 @@ export interface TokenServer {
   close(): Promise<void>
 }
 
-/** Build an unsigned JWT whose payload carries `claims`. */
+/** The one JWKS URL an ID-token verification may fetch. */
+export const OPENAI_JWKS_URL = 'https://auth.openai.com/.well-known/jwks.json'
+
+/** The `kid` these fixtures publish and sign under. */
+const FIXTURE_KID = 'test-rs256'
+
+/** One RSA key pair for the whole test process; the private half stays here. */
+const fixtureKeys = generateKeyPairSync('rsa', { modulusLength: 2048 })
+
+/** The RFC 7517 document OpenAI's `jwks_uri` answers with for these fixtures. */
+export const fixtureJwks = {
+  keys: [{
+    ...fixtureKeys.publicKey.export({ format: 'jwk' }),
+    alg: 'RS256',
+    use: 'sig',
+    kid: FIXTURE_KID,
+  }],
+}
+
+/**
+ * Build an RS256-signed JWT whose payload carries `claims`.
+ *
+ * Signing is synchronous so fixtures stay buildable at call sites, and the
+ * signature is real: it is what a verifier keyed by {@link fixtureJwks}
+ * accepts.
+ *
+ * @param claims - the JWT Claims Set to carry verbatim.
+ * @returns the compact JWS serialization.
+ */
 export function jwt(claims: Record<string, unknown>): string {
   const encode = (value: unknown): string =>
     Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
-  return `${encode({ alg: 'none', typ: 'JWT' })}.${encode(claims)}.`
+  const signingInput = `${encode({ alg: 'RS256', typ: 'JWT', kid: FIXTURE_KID })}.${encode(claims)}`
+  const signature = signData('RSA-SHA256', Buffer.from(signingInput, 'utf8'), fixtureKeys.privateKey)
+  return `${signingInput}.${signature.toString('base64url')}`
+}
+
+/** The URL a fetch-like input addresses, in whichever shape it arrived. */
+export function requestUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  return input.url
+}
+
+/**
+ * Wrap a transport so the fixed OpenAI JWKS URL answers from {@link fixtureJwks}.
+ *
+ * The interception is deliberately narrow: only that one URL is answered
+ * locally, and every other request — the code exchange, discovery, revocation —
+ * still travels over `transport`, which is what lets the proxy suite see the
+ * tunnel. A test that forgets this wrapper reaches the real network instead of
+ * silently verifying against nothing.
+ *
+ * @param transport - the transport every non-JWKS request still uses.
+ * @returns a fetch that serves the fixture key set and delegates the rest.
+ */
+export function withJwks(transport: typeof fetch = globalThis.fetch): typeof fetch {
+  return ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (requestUrl(input) !== OPENAI_JWKS_URL) return transport(input, init)
+    return Promise.resolve(Response.json(fixtureJwks))
+  }) as typeof fetch
 }
 
 /** ID-token claims addressing one issued client id and nonce. */

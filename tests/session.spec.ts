@@ -7,7 +7,7 @@ import { ChatGptSession } from '../src/session.ts'
 import { ChatGptAuth } from '../src/auth/manager.ts'
 import { emptyDocument, writeDocument } from '../src/auth/store.ts'
 import type { ChatGptAdapter } from '../src/adapter.ts'
-import { idTokenClaims, jwt, startTokenServer, type TokenServer } from './helpers.ts'
+import { idTokenClaims, jwt, startTokenServer, withJwks, type TokenServer } from './helpers.ts'
 
 const dirs: string[] = []
 const tokenServers: (() => Promise<void>)[] = []
@@ -34,6 +34,9 @@ async function sessionWith(token: TokenServer, revocationEndpoint?: string): Pro
   const auth = new ChatGptAuth({
     stateDir: dir,
     agentNameHint: 'DeepSeek Harness',
+    // Sign-in verifies the ID token against the published JWKS, so this auth's
+    // transport must answer that one URL or the completion path cannot pass.
+    fetch: withJwks(),
     endpoints: {
       tokenUrl: token.url,
       preferredPort: 0,
@@ -286,7 +289,7 @@ describe('ChatGptSession', () => {
     const status = await session.status()
 
     assert.equal(status.signedIn, false)
-    assert.match(status.error ?? '', /access_denied/)
+    assert.match(status.error ?? '', /declined the authorization/)
     assert.equal(status.pending, undefined)
   })
 

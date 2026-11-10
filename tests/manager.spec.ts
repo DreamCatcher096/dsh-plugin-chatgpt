@@ -166,9 +166,27 @@ describe('ChatGptAuth', () => {
     const document = readDocument(join(dir, 'chatgpt-auth.json'))
     assert.deepEqual(document?.accounts, {})
     assert.deepEqual(document?.registrations, {
-      'subject-1': { clientId: 'oaiapp_issued', email: 'me@example.com', at: document?.registrations?.['subject-1']?.at },
+      'subject-1': { clientId: 'oaiapp_issued', subject: 'subject-1', email: 'me@example.com', at: document?.registrations?.['subject-1']?.at },
     })
   })
+
+  for (const clearAll of [true, false]) {
+    it(`preserves a known real subject in a legacy registration on ${clearAll ? 'all-account' : 'single-account'} sign-out`, async () => {
+      const dir = await stateDir()
+      writeDocument(join(dir, 'chatgpt-auth.json'), {
+        ...emptyDocument('urn:uuid:fixture'),
+        // The local map key deliberately differs from the actual subject.
+        accounts: { 'account-legacy-local-key': grant() }, active: 'account-legacy-local-key',
+        registrations: { 'account-legacy-local-key': { clientId: 'oaiapp_issued', at: 1 } },
+      })
+      const auth = new ChatGptAuth({ stateDir: dir, agentNameHint: 'Test' })
+      auth.signOut(clearAll ? undefined : 'account-legacy-local-key')
+      const stored = readDocument(join(dir, 'chatgpt-auth.json'))
+      assert.equal(stored?.registrations?.['account-legacy-local-key']?.subject, 'subject-1')
+      assert.equal(stored?.registrations?.['account-legacy-local-key']?.clientId, 'oaiapp_issued')
+      assert.deepEqual(stored?.accounts, {})
+    })
+  }
 
   it('offers the retained registration on the next sign-in instead of registering again', async () => {
     const dir = await stateDir()

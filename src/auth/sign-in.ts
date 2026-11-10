@@ -28,6 +28,8 @@ import { EXPIRY_MARGIN_MS, SCOPE, RESOURCE, AUTHORIZE_URL, TOKEN_URL, DIRECT_TOK
 import { generatePkce, randomValue } from './pkce.ts'
 import { startCallbackListener, type CallbackListener, type CallbackQuery } from './callback-server.ts'
 import type { ChatGptCredential } from './credential.ts'
+import { validateIdToken, IdTokenVerificationError } from './id-token.ts'
+export { validateIdToken } from './id-token.ts'
 
 /** One attempt's worth of state, and the two ways it can be completed. */
 export interface SignInAttempt {
@@ -50,7 +52,7 @@ export interface SignInAttempt {
 
 /** Hooks the host uses to narrate one attempt. */
 export interface SignInOptions {
-  /** HTTP transport for the token exchange. */
+  /** HTTP transport for the token exchange and the trusted JWKS request. */
   fetch?: typeof fetch
   /** A stable, per-installation host identifier, sent as `ext_agent_host_id`. */
   agentHostId: string
@@ -63,6 +65,8 @@ export interface SignInOptions {
    */
   registration?: {
     clientId: string
+    /** The original ID-token subject, never an email or a local account key. */
+    subject?: string
     idTokenHint?: string
     loginHint?: string
   }
@@ -87,7 +91,7 @@ interface Callback {
 /** Parse a full redirect URL, an absolute URL carrying a code, or a bare code. */
 function parseSubmitted(value: string, expectedRedirectUri: string): Callback {
   const trimmed = value.trim()
-  if (trimmed.length === 0) throw new Error('paste the full redirect URL from the browser, or the code itself')
+  if (trimmed.length === 0) throw new SignInError('paste the full redirect URL from the browser, or the code itself')
 
   // A bare code is the one input that is not a URL; everything else is parsed
   // so the state can be checked rather than trusted.
@@ -99,17 +103,17 @@ function parseSubmitted(value: string, expectedRedirectUri: string): Callback {
   try {
     url = new URL(trimmed)
   } catch {
-    throw new Error('that does not look like a URL; paste the full redirect URL from the browser')
+    throw new SignInError('that does not look like a URL; paste the full redirect URL from the browser')
   }
 
   const expected = new URL(expectedRedirectUri)
   if (url.origin !== expected.origin || url.pathname !== expected.pathname) {
-    throw new Error(`the pasted URL must start with ${expectedRedirectUri}`)
+    throw new SignInError(`the pasted URL must start with ${expectedRedirectUri}`)
   }
   const error = url.searchParams.get('error')
-  if (error !== null && error !== '') throw new Error(`ChatGPT declined the authorization: ${error}`)
+  if (error !== null && error !== '') throw new SignInError('ChatGPT declined the authorization')
   const code = url.searchParams.get('code')
-  if (code === null || code === '') throw new Error('the pasted URL carries no authorization code')
+  if (code === null || code === '') throw new SignInError('the pasted URL carries no authorization code')
   return { code, clientId: url.searchParams.get('client_id')?.trim() ?? '' }
 }
 
@@ -122,91 +126,12 @@ interface TokenResponse {
   scope?: unknown
 }
 
-/** The decoded payload of an ID token, read but not trusted until checked. */
-interface IdTokenClaims {
-  iss?: unknown
-  aud?: unknown
-  sub?: unknown
-  exp?: unknown
-  nonce?: unknown
-  email?: unknown
-  [claim: string]: unknown
-}
-
-/** Decode one JWT payload without verifying it; {@link validateIdToken} does the checking. */
-function decodeJwtPayload(token: string): IdTokenClaims | undefined {
-  const parts = token.split('.')
-  if (parts.length !== 3) return undefined
-  try {
-    const payload = parts[1] ?? ''
-    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as IdTokenClaims
-  } catch {
-    return undefined
-  }
-}
-
 /** A required non-empty string field, or a named failure. */
 function requireString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new Error(`the token response is missing ${field}`)
+    throw new SignInError(`the token response is missing ${field}`)
   }
   return value
-}
-
-/**
- * Check the claims this flow depends on.
- *
- * Signature verification against OpenAI's published JWKS is documented
- * separately and is not performed here; this validates the claims that decide
- * whether the grant may be used, and reports the account identity the host
- * stores. The token arrives over TLS directly from the token endpoint in
- * response to this host's own PKCE-protected exchange, which is the case these
- * checks defend.
- *
- * @param token - the ID token from the token response.
- * @param expectedAudience - the issued client id the token must be addressed to.
- * @param expectedNonce - the nonce this attempt generated.
- * @returns the account identity and display facts.
- */
-export function validateIdToken(
-  token: string,
-  expectedAudience: string,
-  expectedNonce: string,
-): { subject: string, email?: string, planType?: string } {
-  const claims = decodeJwtPayload(token)
-  if (claims === undefined) throw new Error('the ID token is not a readable JWT')
-
-  const issuer = claims.iss
-  if (issuer !== 'https://auth.openai.com') {
-    throw new Error(`the ID token came from an unexpected issuer: ${String(issuer)}`)
-  }
-  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud]
-  if (!audiences.includes(expectedAudience)) {
-    throw new Error('the ID token is addressed to a different client than this installation registered')
-  }
-  if (claims.nonce !== expectedNonce) {
-    throw new Error('the ID token carries a different nonce than this sign-in attempt')
-  }
-  const expiry = claims.exp
-  if (typeof expiry === 'number' && expiry * 1000 <= Date.now()) {
-    throw new Error('the ID token is already expired')
-  }
-  const subject = requireString(claims.sub, 'sub')
-
-  const profile = claims['https://api.openai.com/profile']
-  const auth = claims['https://api.openai.com/auth']
-  const email = typeof profile === 'object' && profile !== null
-    ? (profile as Record<string, unknown>)['email']
-    : undefined
-  const planType = typeof auth === 'object' && auth !== null
-    ? (auth as Record<string, unknown>)['chatgpt_plan_type']
-    : undefined
-
-  return {
-    subject,
-    ...typeof email === 'string' && email.length > 0 ? { email } : {},
-    ...typeof planType === 'string' && planType.length > 0 ? { planType } : {},
-  }
 }
 
 /**
@@ -271,9 +196,12 @@ export async function beginSignIn(options: SignInOptions): Promise<SignInAttempt
 
   /** Validate one callback and exchange its code for a stored-ready credential. */
   const complete = async (callback: Callback): Promise<void> => {
-    const clientId = callback.clientId.length > 0 ? callback.clientId : options.registration?.clientId ?? ''
-    if (clientId.length === 0) {
-      throw new Error(
+    if (registration !== undefined && callback.clientId.length > 0 && callback.clientId !== registration.clientId) {
+      throw new SignInError('the authorization callback returned a different client id than the stored registration')
+    }
+    const clientId = registration?.clientId ?? callback.clientId
+    if (clientId.length === 0 || clientId === DYNAMIC_CLIENT_ID) {
+      throw new SignInError(
         'the authorization callback returned no issued client id; a first-time registration must issue one,'
         + ' and the dynamic entry point is not a registration',
       )
@@ -291,8 +219,8 @@ export async function beginSignIn(options: SignInOptions): Promise<SignInAttempt
       }),
     })
     if (!response.ok) {
-      const body = await response.text().catch(() => '')
-      throw new Error(`the token exchange failed (${response.status}): ${body || response.statusText}`)
+      // The response body may echo tokens or the authorization callback.
+      throw new SignInError(`the token exchange failed (${response.status})`)
     }
     const token = (await response.json()) as TokenResponse
     const access = requireString(token.access_token, 'access_token')
@@ -300,16 +228,18 @@ export async function beginSignIn(options: SignInOptions): Promise<SignInAttempt
     const idToken = requireString(token.id_token, 'id_token')
     const granted = requireString(token.scope, 'scope').split(/\s+/).filter(Boolean)
     if (!granted.includes(DIRECT_TOKEN_SCOPE)) {
-      throw new Error(
-        `the ChatGPT account granted ${granted.join(' ') || 'no scopes'}, which does not include`
-        + ` ${DIRECT_TOKEN_SCOPE}; this account cannot spend its ChatGPT plan on inference`,
+      throw new SignInError(
+        `the ChatGPT account did not grant the required ${DIRECT_TOKEN_SCOPE} scope`,
       )
     }
     const expiresIn = token.expires_in
     if (typeof expiresIn !== 'number' || !Number.isFinite(expiresIn) || expiresIn <= 0) {
-      throw new Error('the token response carries no usable expires_in')
+      throw new SignInError('the token response carries no usable expires_in')
     }
-    const identity = validateIdToken(idToken, clientId, nonce)
+    const identity = await validateIdToken(idToken, clientId, nonce, {
+      ...options.fetch === undefined ? {} : { fetch: options.fetch },
+      ...registration?.subject === undefined ? {} : { subject: registration.subject },
+    })
     resolveResult({
       accessToken: access,
       refreshToken: refresh,
@@ -327,17 +257,17 @@ export async function beginSignIn(options: SignInOptions): Promise<SignInAttempt
     if (settled) return
     finish()
     try {
-      if (query.error !== undefined) throw new Error(`ChatGPT declined the authorization: ${query.error}`)
-      if (query.state !== state) throw new Error('the callback state does not match this sign-in attempt')
-      if (query.code === undefined || query.code === '') throw new Error('the callback carried no authorization code')
+      if (query.error !== undefined) throw new SignInError('ChatGPT declined the authorization')
+      if (query.state !== state) throw new SignInError('the callback state does not match this sign-in attempt')
+      if (query.code === undefined || query.code === '') throw new SignInError('the callback carried no authorization code')
       await complete({ code: query.code, clientId: query.clientId ?? '' })
     } catch (error) {
-      rejectResult(error instanceof Error ? error : new Error(String(error)))
+      rejectResult(safeSignInError(error))
     }
   }).catch((error: unknown) => {
     if (settled) return
     finish()
-    rejectResult(error instanceof Error ? error : new Error(String(error)))
+    rejectResult(safeSignInError(error))
   })
 
   timer = setTimeout(() => {
@@ -361,17 +291,17 @@ export async function beginSignIn(options: SignInOptions): Promise<SignInAttempt
      * attempt's state is consumed.
      */
     async submit(value: string): Promise<void> {
-      if (settled) throw new Error('this sign-in attempt has already finished')
+      if (settled) throw new SignInError('this sign-in attempt has already finished')
       const callback = parseSubmitted(value, listener.redirectUri)
       const stateInPaste = stateOfSubmission(value)
       if (stateInPaste !== undefined && stateInPaste !== state) {
-        throw new Error('the pasted callback state does not match this sign-in attempt')
+        throw new SignInError('the pasted callback state does not match this sign-in attempt')
       }
       finish()
       try {
         await complete(callback)
       } catch (error) {
-        rejectResult(error instanceof Error ? error : new Error(String(error)))
+        rejectResult(safeSignInError(error))
       }
     },
     cancel(reason = 'the sign-in attempt was cancelled'): void {
@@ -395,3 +325,12 @@ function stateOfSubmission(value: string): string | undefined {
 
 /** The callback host and path this module expects. */
 export const CALLBACK_SHAPE = { host: CALLBACK_HOST, path: CALLBACK_PATH }
+
+/** Errors created locally contain no server-controlled values. */
+class SignInError extends Error {}
+
+/** Never expose arbitrary transport exceptions or server-controlled values. */
+function safeSignInError(error: unknown): Error {
+  if (error instanceof SignInError || error instanceof IdTokenVerificationError) return error
+  return new Error('ChatGPT sign-in failed while exchanging or verifying the authorization')
+}

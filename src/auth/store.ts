@@ -49,6 +49,8 @@ export interface ChatGptStoreDocument {
 export interface ChatGptRegistration {
   /** The issued `oaiapp_…` id this account registered. */
   clientId: string
+  /** The actual ID-token subject, when known; never inferred from a local key. */
+  subject?: string
   /** The account's email, used as `login_hint` on a later sign-in. */
   email?: string
   /** When this registration was last confirmed, for choosing the most recent. */
@@ -111,6 +113,8 @@ function registrationsOf(value: unknown): Record<string, ChatGptRegistration> {
     kept[subject] = {
       clientId: candidate.clientId,
       at: typeof candidate.at === 'number' ? candidate.at : 0,
+      ...typeof candidate.subject === 'string' && candidate.subject.trim().length > 0
+        ? { subject: candidate.subject } : {},
       ...typeof candidate.email === 'string' ? { email: candidate.email } : {},
     }
   }
